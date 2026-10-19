@@ -1,0 +1,153 @@
+name: writeback
+
+# Flow 5, code side.
+#   writeback  when ci passes on a push to main (a squash-merged PR "SRS-XXX-NNN: ..."),
+#              opens a QMS PR on branch writeback/<SRS ID> that sets only the SRS's bot
+#              fields: status implemented, pr, merge_commit, test_run (this ci run), and
+#              design_sha when docs/design/ changed. QA approving that PR is the SRS row
+#              approval; the QMS's create-issue.yml then closes the code issue.
+#   guard      when a `qms` issue is closed by hand while its SRS is still approved in
+#              the QMS, reopens it and says why. Nobody can short-circuit the gate.
+# Needs the qms-bot App on both repos (QMS_APP_ID, QMS_APP_KEY).
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+  issues: write
+
+env:
+  QMS_OWNER: AaronBrennan1
+  QMS_REPO_NAME: tcellcare-qms
+
+jobs:
+  writeback:
+    if: >
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: writeback-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+    steps:
+      - name: Find the merged PR and its SRS
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/pulls" \
+                 --jq '[.[] | select(.merged_at != null and .base.ref == "main")][0] // empty')
+          if [ -z "$pr" ]; then echo "::notice::$SHA is not a merged PR; nothing to write back"; exit 0; fi
+          number=$(jq -r .number <<< "$pr")
+          title=$(jq -r .title <<< "$pr")
+          if [[ ! "$title" =~ ^(SRS-[A-Z]{3}-[0-9]{3}): ]]; then
+            echo "::warning::#$number '$title' carries no SRS ID; nothing to write back"; exit 0
+          fi
+          srs="${BASH_REMATCH[1]}"
+          design=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$number/files" --jq '.[].filename' \
+                     | grep -q '^docs/design/' && echo "$SHA" || true)
+          { echo "number=$number"; echo "srs=$srs"; echo "design=$design"; } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        if: steps.pr.outputs.srs != ''
+        with:
+          name: test-results
+          path: test-results
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - id: app
+        if: steps.pr.outputs.srs != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.QMS_APP_ID }}
+          private-key: ${{ secrets.QMS_APP_KEY }}
+          owner: ${{ env.QMS_OWNER }}
+          repositories: ${{ env.QMS_REPO_NAME }}
+
+      - uses: actions/checkout@v4
+        if: steps.pr.outputs.srs != ''
+        with:
+          repository: ${{ env.QMS_OWNER }}/${{ env.QMS_REPO_NAME }}
+          ref: main
+          token: ${{ steps.app.outputs.token }}
+          path: qms
+
+      - uses: actions/setup-python@v5
+        if: steps.pr.outputs.srs != ''
+        with:
+          python-version: '3.12'
+
+      - name: Write back and open the QMS PR
+        if: steps.pr.outputs.srs != ''
+        working-directory: qms
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SRS: ${{ steps.pr.outputs.srs }}
+          NUMBER: ${{ steps.pr.outputs.number }}
+          DESIGN: ${{ steps.pr.outputs.design }}
+        run: |
+          pip install -q -r tools/requirements.txt
+          qms="$QMS_OWNER/$QMS_REPO_NAME"
+          python3 tools/writeback.py --srs "$SRS" --pr "$GITHUB_REPOSITORY#$NUMBER" \
+            --merge-commit "$SHA" --test-run "$RUN_URL" --coverage ../test-results/coverage.json \
+            --body-out ../body.md ${DESIGN:+--design-sha "$DESIGN"}
+          branch="writeback/$SRS"
+          existing=$(gh pr list -R "$qms" --head "$branch" --state open --json number --jq '.[0].number // empty')
+          # a branch left over from an earlier, merged write-back would carry a stale base
+          [ -n "$existing" ] || gh api -X DELETE "repos/$qms/git/refs/heads/$branch" 2>/dev/null || true
+          python3 tools/bot_commit.py --repo "$qms" --branch "$branch" --create-from "$(git rev-parse HEAD)" \
+            --message "$SRS: implemented in $GITHUB_REPOSITORY#$NUMBER" "requirements/$SRS.md"
+          title="$SRS: implemented in $GITHUB_REPOSITORY#$NUMBER"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" -R "$qms" --title "$title" --body-file ../body.md
+          else
+            gh pr create -R "$qms" --base main --head "$branch" --title "$title" --body-file ../body.md
+          fi
+
+  guard:
+    if: github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'qms')
+    runs-on: ubuntu-latest
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.QMS_APP_ID }}
+          private-key: ${{ secrets.QMS_APP_KEY }}
+          owner: ${{ env.QMS_OWNER }}
+          repositories: ${{ env.QMS_REPO_NAME }}
+
+      - name: Reopen if the SRS is still approved
+        env:
+          QMS_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          LABELS: ${{ toJSON(github.event.issue.labels.*.name) }}
+          NUMBER: ${{ github.event.issue.number }}
+        run: |
+          srs=$(jq -r '[.[] | select(test("^SRS-[A-Z]{3}-[0-9]{3}$"))][0] // empty' <<< "$LABELS")
+          [ -n "$srs" ] || { echo "no SRS label"; exit 0; }
+          file=$(GH_TOKEN="$QMS_TOKEN" gh api "repos/$QMS_OWNER/$QMS_REPO_NAME/contents/requirements/$srs.md?ref=main" \
+                   -H "Accept: application/vnd.github.raw" 2>/dev/null) || { echo "$srs not in the QMS"; exit 0; }
+          front=$(awk 'NR==1 && /^---$/ {on=1; next} on && /^---$/ {exit} on' <<< "$file")
+          status=$(sed -n 's/^status:[[:space:]]*//p' <<< "$front")
+          issue=$(sed -n 's/^issue:[[:space:]]*//p' <<< "$front")
+          if [ "$status" = "approved" ] && [ "$issue" = "$GITHUB_REPOSITORY#$NUMBER" ]; then
+            gh issue reopen "$NUMBER" -R "$GITHUB_REPOSITORY"
+            gh issue comment "$NUMBER" -R "$GITHUB_REPOSITORY" --body \
+              "Reopened by qms-bot: $srs is still **approved** in the QMS. This issue closes itself once a PR \`$srs: ...\` merges and QA approves the updated requirement row (Flow 5). Don't close it by hand."
+          else
+            echo "$srs is $status (issue $issue); closing #$NUMBER is fine"
+          fi

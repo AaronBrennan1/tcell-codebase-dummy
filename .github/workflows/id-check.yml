@@ -1,0 +1,37 @@
+name: id-check
+
+# Flow 3 check `id-check`: the branch name and the PR title carry the same SRS ID,
+# and that ID has an open `qms` issue (created by qms-bot from an approved SRS).
+#   branch  SRS-FUN-052-red-background      (gh issue develop <n> --checkout --name ...)
+#   title   SRS-FUN-052: Make the background red
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  id-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the SRS ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          re='^(SRS-[A-Z]{3}-[0-9]{3})'
+          [[ "$TITLE" =~ $re:\  ]] && title_id="${BASH_REMATCH[1]}" || {
+            echo "::error::PR title must start with the SRS ID: 'SRS-XXX-NNN: <summary>' (got '$TITLE')"; exit 1; }
+          [[ "$BRANCH" =~ $re ]] && branch_id="${BASH_REMATCH[1]}" || {
+            echo "::error::branch name must start with the SRS ID, e.g. $title_id-short-name (got '$BRANCH')"; exit 1; }
+          [ "$title_id" = "$branch_id" ] || {
+            echo "::error::title says $title_id but the branch says $branch_id"; exit 1; }
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --label qms --label "$title_id" \
+                --json number --jq '.[0].number // empty')
+          [ -n "$n" ] || {
+            echo "::error::no open qms issue labelled $title_id: the requirement is not approved in the QMS, or is already done"; exit 1; }
+          echo "id-check: $title_id, issue #$n" | tee -a "$GITHUB_STEP_SUMMARY"

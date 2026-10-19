@@ -1,0 +1,22 @@
+:root {
+  --bg: #f6f7f9;
+  --fg: #1d2330;
+  --accent: #1d6fb8;
+}
+
+body {
+  margin: 0;
+  font: 16px/1.5 system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+main {
+  max-width: 40rem;
+  margin: 4rem auto;
+  padding: 0 1rem;
+}
+
+h1 {
+  color: var(--accent);
+}

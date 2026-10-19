@@ -1,0 +1,18 @@
+{
+  "name": "tcell-codebase-dummy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A minimal T Cell Care demo site: the code repo of the two-repo QMS.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs",
+    "test": "node --test --test-reporter=spec \"test/**/*.test.mjs\" \"tests/**/*.test.mjs\"",
+    "test:unit": "node --test --test-reporter=spec \"test/**/*.test.mjs\" \"tests/*/unit/**/*.test.mjs\"",
+    "test:integration": "node --test --test-reporter=spec \"tests/*/integration/**/*.test.mjs\" \"tests/*/system/**/*.test.mjs\"",
+    "test:qms": "mkdir -p test-results && node --test --test-reporter=spec --test-reporter=./scripts/qms-reporter.mjs --test-reporter-destination=stdout --test-reporter-destination=test-results/coverage.json \"test/**/*.test.mjs\" \"tests/**/*.test.mjs\""
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

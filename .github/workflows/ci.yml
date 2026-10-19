@@ -1,0 +1,96 @@
+name: ci
+
+# Flow 3 checks `unit`, `integration` and `risk-coverage`, on every PR and on every
+# push to main (the merge commit) and release branches. Tests are tagged with the SRS
+# and RISK IDs they verify, in their names: test("[SRS-FUN-052][RISK-003] ...").
+# scripts/qms-reporter.mjs turns that into coverage.json; with junit.xml it is kept as
+# the `test-results` artifact, which the QMS write-back (writeback.yml) and trace read.
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'release/**']
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Unit tests
+        run: |
+          mkdir -p partial
+          node --test \
+            --test-reporter=spec --test-reporter-destination=stdout \
+            --test-reporter=junit --test-reporter-destination=partial/junit-unit.xml \
+            --test-reporter=./scripts/qms-reporter.mjs --test-reporter-destination=partial/coverage-unit.json \
+            "test/**/*.test.mjs" "tests/*/unit/**/*.test.mjs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: partial-unit
+          path: partial/
+          retention-days: 7
+
+  # required for safety class B and C; for class A it may be relaxed once the class is confirmed
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Integration and system tests
+        run: |
+          mkdir -p partial
+          node --test \
+            --test-reporter=spec --test-reporter-destination=stdout \
+            --test-reporter=junit --test-reporter-destination=partial/junit-integration.xml \
+            --test-reporter=./scripts/qms-reporter.mjs --test-reporter-destination=partial/coverage-integration.json \
+            "tests/*/integration/**/*.test.mjs" "tests/*/system/**/*.test.mjs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: partial-integration
+          path: partial/
+          retention-days: 7
+
+  risk-coverage:
+    needs: [unit, integration]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: partial-*
+          path: partials
+      - name: Merge the test results
+        run: node scripts/merge-test-results.mjs test-results partials/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/
+          retention-days: 90
+      - name: Every RISK on the issue has a passing tagged test
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node scripts/risk-coverage.mjs test-results/coverage.json
+      - name: Fail if a test job failed
+        if: needs.unit.result != 'success' || needs.integration.result != 'success'
+        run: |
+          echo "::error::unit: ${{ needs.unit.result }}, integration: ${{ needs.integration.result }}"
+          exit 1

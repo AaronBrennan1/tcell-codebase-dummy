@@ -1,0 +1,152 @@
+name: release
+
+# Flow 7, code side. Run by the release manager (Actions → release → Run workflow)
+# on a frozen branch release/vX.Y.Z; the `release` environment holds it until they
+# approve. It
+#   1. runs the full suite on the frozen commit and generates the final SBOM;
+#   2. runs the QMS trace in release mode against that build: a gap stops here;
+#   3. builds and signs the artifact (cosign, keyless), tags vX.Y.Z on the frozen
+#      commit (the only path allowed to create v* tags) and publishes the GitHub release;
+#   4. sends repository_dispatch `release` to the QMS repo, whose release-record.yml
+#      writes the release record for QA to sign.
+# Needs the qms-bot App on both repos (QMS_APP_ID, QMS_APP_KEY).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, e.g. v1.4.0 (branch release/<version> must exist)
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+  id-token: write
+
+env:
+  QMS_OWNER: AaronBrennan1
+  QMS_REPO_NAME: tcellcare-qms
+  VERSION: ${{ inputs.version }}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Check the version
+        run: |
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be vX.Y.Z"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: release/${{ inputs.version }}
+          fetch-depth: 0
+
+      - name: Freeze
+        id: freeze
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null; then
+            echo "::error::tag $VERSION already exists; versions are never reused"; exit 1
+          fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "design=$(git log -1 --format=%H -- docs/design)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm ci
+
+      - name: Full suite on the frozen commit
+        run: |
+          mkdir -p evidence
+          node --test \
+            --test-reporter=spec --test-reporter-destination=stdout \
+            --test-reporter=junit --test-reporter-destination=evidence/junit.xml \
+            --test-reporter=./scripts/qms-reporter.mjs --test-reporter-destination=evidence/coverage.json \
+            "test/**/*.test.mjs" "tests/**/*.test.mjs"
+
+      - name: Final SBOM
+        run: npm sbom --sbom-format cyclonedx --omit dev --package-lock-only > evidence/sbom.cdx.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence
+          path: evidence/
+          retention-days: 90
+
+      - id: qms
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.QMS_APP_ID }}
+          private-key: ${{ secrets.QMS_APP_KEY }}
+          owner: ${{ env.QMS_OWNER }}
+          repositories: ${{ env.QMS_REPO_NAME }}
+
+      - id: code
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.QMS_APP_ID }}
+          private-key: ${{ secrets.QMS_APP_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.QMS_OWNER }}/${{ env.QMS_REPO_NAME }}
+          ref: main
+          token: ${{ steps.qms.outputs.token }}
+          path: qms
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Trace gate on the frozen build
+        env:
+          CODE_TOKEN: ${{ steps.code.outputs.token }}
+        run: |
+          pip install -q -r qms/tools/requirements.txt
+          python3 qms/tools/trace.py --root qms --gate --out-dir evidence/trace \
+            --title "Trace matrix $VERSION (release gate)" \
+            --coverage evidence/coverage.json --release-commit "${{ steps.freeze.outputs.commit }}" \
+            --code-repo "$GITHUB_REPOSITORY"
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="tcell-codebase-dummy-$VERSION/" \
+            -o "dist/tcell-codebase-dummy-$VERSION.tar.gz" "${{ steps.freeze.outputs.commit }}"
+          cp evidence/sbom.cdx.json "dist/tcell-codebase-dummy-$VERSION.cdx.json"
+          (cd dist && sha256sum * > SHA256SUMS)
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign
+        run: |
+          for f in dist/tcell-codebase-dummy-$VERSION.tar.gz dist/SHA256SUMS; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
+
+      - name: Tag and publish
+        env:
+          GH_TOKEN: ${{ steps.code.outputs.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$VERSION" \
+            -f sha="${{ steps.freeze.outputs.commit }}" >/dev/null
+          gh release create "$VERSION" dist/* -R "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$VERSION" --notes "Signed build of ${{ steps.freeze.outputs.commit }}. The release record is in the QMS (releases/$VERSION/)."
+
+      - name: Dispatch the release record
+        env:
+          GH_TOKEN: ${{ steps.qms.outputs.token }}
+        run: |
+          assets=$(GH_TOKEN="${{ steps.code.outputs.token }}" gh release view "$VERSION" -R "$GITHUB_REPOSITORY" \
+                     --json assets --jq '[.assets[].url]')
+          jq -n --arg v "$VERSION" --arg c "${{ steps.freeze.outputs.commit }}" \
+                --arg d "${{ steps.freeze.outputs.design }}" --arg r "$GITHUB_RUN_ID" --argjson a "$assets" \
+                '{event_type: "release", client_payload: {version: $v, commit: $c, design_sha: $d, run_id: $r, artifacts: $a}}' \
+            | gh api "repos/$QMS_OWNER/$QMS_REPO_NAME/dispatches" --input -

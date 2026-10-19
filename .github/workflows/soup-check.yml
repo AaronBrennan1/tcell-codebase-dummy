@@ -1,0 +1,112 @@
+name: soup-check
+
+# Flow 4 check `soup-check`. Passes at once when no lock file changed. Otherwise it
+# generates a CycloneDX SBOM of the production dependencies and compares it with the
+# QMS repo's soup/SOUP-*.md: every package and version needs an assessment at
+# `assessment_status: accepted`. On a gap it fails, labels the PR `soup-review`, and
+# keeps one comment listing the missing packages. The label stays as the record.
+# Needs the qms-bot App (QMS_APP_ID, QMS_APP_KEY) to read the QMS repo.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  QMS_OWNER: AaronBrennan1
+  QMS_REPO_NAME: tcellcare-qms
+
+jobs:
+  soup-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Did a lock file change?
+        id: lock
+        run: |
+          changed=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" \
+            | grep -E '(^|/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Pipfile\.lock|requirements[^/]*\.txt|Cargo\.lock|Package\.resolved|Podfile\.lock)$' || true)
+          echo "changed<<EOF" >> "$GITHUB_OUTPUT"; echo "$changed" >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
+          if [ -z "$changed" ]; then echo "soup-check: no lock file changed" | tee -a "$GITHUB_STEP_SUMMARY"; fi
+          other=$(echo "$changed" | grep -vE '(^|/)(package-lock\.json|npm-shrinkwrap\.json)$' || true)
+          if [ -n "$other" ]; then
+            echo "::error::no SBOM generator is configured for: $other. Add one to soup-check.yml."; exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.lock.outputs.changed != ''
+        with:
+          node-version: 22
+
+      - name: Generate the SBOM
+        if: steps.lock.outputs.changed != ''
+        run: npm sbom --sbom-format cyclonedx --omit dev --package-lock-only > sbom.cdx.json
+
+      - uses: actions/upload-artifact@v4
+        if: steps.lock.outputs.changed != ''
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+      - id: app
+        if: steps.lock.outputs.changed != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.QMS_APP_ID }}
+          private-key: ${{ secrets.QMS_APP_KEY }}
+          owner: ${{ env.QMS_OWNER }}
+          repositories: ${{ env.QMS_REPO_NAME }}
+
+      - uses: actions/checkout@v4
+        if: steps.lock.outputs.changed != ''
+        with:
+          repository: ${{ env.QMS_OWNER }}/${{ env.QMS_REPO_NAME }}
+          ref: main
+          token: ${{ steps.app.outputs.token }}
+          path: qms
+
+      - uses: actions/setup-python@v5
+        if: steps.lock.outputs.changed != ''
+        with:
+          python-version: '3.12'
+
+      - name: Compare with the SOUP assessments
+        id: compare
+        if: steps.lock.outputs.changed != ''
+        run: |
+          pip install -q -r qms/tools/requirements.txt
+          python3 qms/tools/soup_check.py --root qms --sbom sbom.cdx.json --missing-out missing.md
+
+      - name: Label and comment
+        if: failure() && steps.compare.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh label create soup-review -R "$GITHUB_REPOSITORY" --color 5319E7 \
+            --description "Dependency change needs a SOUP assessment" 2>/dev/null || true
+          gh pr edit "$PR" -R "$GITHUB_REPOSITORY" --add-label soup-review
+          {
+            echo "<!-- soup-check -->"
+            echo "**soup-check:** these packages have no accepted SOUP assessment in"
+            echo "[\`$QMS_OWNER/$QMS_REPO_NAME\`](https://github.com/$QMS_OWNER/$QMS_REPO_NAME/tree/main/soup):"
+            echo
+            cat missing.md
+            echo
+            echo "Add a \`soup/SOUP-NNN.md\` for each, from the"
+            echo "[SOUP template](https://github.com/$QMS_OWNER/$QMS_REPO_NAME/blob/main/templates/SOUP.md),"
+            echo "in a PR to the QMS repo. Once QA approves and it merges, re-run this check."
+          } > comment.md
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+                 --jq '[.[] | select(.body | startswith("<!-- soup-check -->"))][0].id // empty')
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@comment.md >/dev/null
+          else
+            gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body-file comment.md
+          fi
